@@ -4,17 +4,7 @@ macOS 菜单栏剪贴板历史。复制文字、文件路径或图片后自动�
 
 记录存在本机 `~/Library/Application Support/LocalPaste/`，不上传。密码管理器（1Password、Bitwarden、钥匙串、Passwords）里的复制会被跳过。
 
-## 别的电脑能不能直接下这个 App
-
-不能。仓库里的 `LocalPaste.app`（如果有）是在一台 Apple 芯片 Mac 上 ad-hoc 签名打出来的：
-
-- 只含 **arm64**，Intel Mac 跑不了
-- 没有 Apple 开发者签名，也没有公证
-- 换一台电脑打开，系统会拦（已损坏 / 无法验证开发者）
-
-在要用的那台 Mac 上从源码编译，签名就是那台机器自己的，可以直接用。
-
-## 在另一台 Mac 上使用
+## 使用说明
 
 需要：**macOS 13+**，Apple 芯片，已安装 Xcode Command Line Tools（`xcode-select --install`）。
 
