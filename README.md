@@ -1,6 +1,6 @@
 # Local Paste
 
-macOS 菜单栏剪贴板历史。复制文字、文件路径或图片后自动记下，用 **⌘⇧V** 打开面板，回车粘贴到当前应用。
+macOS 菜单栏剪贴板历史。复制文字、文件路径或图片后自动记下，用 **⌘⇧V** 打开面板，回车粘贴到当前应用；粘贴/复制后该条移到列表最左侧。
 
 记录存在本机 `~/Library/Application Support/LocalPaste/`，不上传。密码管理器（1Password、Bitwarden、钥匙串、Passwords）里的复制会被跳过。
 

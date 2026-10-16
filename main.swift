@@ -78,6 +78,14 @@ final class Store {
         return true
     }
 
+    /// Bump a clip to the left of its pin group (newest first).
+    func touch(_ id: UUID) {
+        guard let i = clips.firstIndex(where: { $0.id == id }) else { return }
+        clips[i].created = Date()
+        sortAndTrim()
+        save()
+    }
+
     func togglePin(_ id: UUID) {
         guard let i = clips.firstIndex(where: { $0.id == id }) else { return }
         clips[i].pinned.toggle()
@@ -160,6 +168,7 @@ final class Store {
 }
 
 final class ClipCell: NSCollectionViewItem {
+
     static let reuse = NSUserInterfaceItemIdentifier("card")
     let card = NSView()
     let kindLabel = NSTextField(labelWithString: "")
@@ -213,6 +222,11 @@ final class ClipCell: NSCollectionViewItem {
         for v in [kindLabel, timeLabel, appIcon, body, thumb, countLabel, indexBadge] {
             v.translatesAutoresizingMaskIntoConstraints = false
             card.addSubview(v)
+        }
+        for tf in [kindLabel, timeLabel, body, countLabel, indexBadge] {
+            tf.isEditable = false
+            tf.isSelectable = false
+            tf.refusesFirstResponder = true
         }
         NSLayoutConstraint.activate([
             card.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 6),
@@ -347,6 +361,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSCollectionViewData
     var suppressChange = -1
     var didPrompt = false
     var selected = 0
+    /// App that had focus before the panel stole it (needed so ⌘V lands in the right field).
+    var previousApp: NSRunningApplication?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let image = NSImage(systemSymbolName: "doc.on.clipboard", accessibilityDescription: "Local Paste") {
@@ -361,7 +377,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSCollectionViewData
         panel.level = .popUpMenu
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = false
-        panel.isMovableByWindowBackground = true
+        panel.isMovableByWindowBackground = false
         panel.isReleasedWhenClosed = false
         panel.isOpaque = false
         panel.backgroundColor = .clear
@@ -380,12 +396,29 @@ final class AppController: NSObject, NSApplicationDelegate, NSCollectionViewData
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             self?.localKey(event) ?? event
         }
+        // Panel is nonactivating — mouse often never reaches collection.
+        // Handle item clicks + outside-dismiss from monitors that still see the event.
+        NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
+            guard let self else { return event }
+            return self.handlePanelMouse(event) ? nil : event
+        }
         NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] event in
             guard let self, self.panel.isVisible else { return }
             let point = NSEvent.mouseLocation
-            if !self.panel.frame.contains(point) {
-                DispatchQueue.main.async { self.panel.orderOut(nil) }
+            if self.panel.frame.contains(point) {
+                // Global monitor cannot swallow; still drive selection while app is inactive.
+                if event.type == .leftMouseDown {
+                    DispatchQueue.main.async { self.clickItemAtScreenPoint(point, clickCount: event.clickCount) }
+                }
+                return
             }
+            // ignore clicks on our status item
+            if let btn = self.statusItem.button, let win = btn.window {
+                let b = btn.convert(btn.bounds, to: nil)
+                let screen = win.convertToScreen(b)
+                if screen.contains(point) { return }
+            }
+            DispatchQueue.main.async { self.panel.orderOut(nil) }
         }
     }
 
@@ -411,6 +444,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSCollectionViewData
         collection.delegate = self
         collection.isSelectable = true
         collection.allowsMultipleSelection = false
+        collection.allowsEmptySelection = false
         collection.backgroundColors = [.clear]
         collection.register(ClipCell.self, forItemWithIdentifier: ClipCell.reuse)
         scroll.documentView = collection
@@ -478,17 +512,22 @@ final class AppController: NSObject, NSApplicationDelegate, NSCollectionViewData
             panel.orderOut(nil)
             return
         }
+        let front = NSWorkspace.shared.frontmostApplication
+        if front?.bundleIdentifier != Bundle.main.bundleIdentifier {
+            previousApp = front
+        }
         search.stringValue = ""
         reload(selectFirst: true)
         refreshHint()
-if let screen = NSScreen.main ?? NSScreen.screens.first {
+        if let screen = NSScreen.main ?? NSScreen.screens.first {
             let vf = screen.visibleFrame
             let width = vf.width - 16
             panel.setFrame(NSRect(x: vf.minX + 8, y: vf.minY + 8, width: width, height: 380), display: false)
         }
         panel.layoutIfNeeded()
+        NSApp.activate(ignoringOtherApps: true)
         panel.orderFrontRegardless()
-        panel.makeKey()
+        panel.makeKeyAndOrderFront(nil)
         panel.makeFirstResponder(search)
     }
 
@@ -580,10 +619,68 @@ if let screen = NSScreen.main ?? NSScreen.screens.first {
         return item
     }
 
+    /// Returns true if the event was handled (should be swallowed).
+    func handlePanelMouse(_ event: NSEvent) -> Bool {
+        guard panel.isVisible else { return false }
+        let screenPoint: NSPoint
+        if let win = event.window {
+            screenPoint = win.convertToScreen(NSRect(origin: event.locationInWindow, size: .zero)).origin
+        } else {
+            screenPoint = NSEvent.mouseLocation
+        }
+        if !panel.frame.contains(screenPoint) { return false }
+        // let search field keep its own clicks
+        if let searchWin = search.window {
+            let searchScreen = searchWin.convertToScreen(search.convert(search.bounds, to: nil))
+            if searchScreen.contains(screenPoint) { return false }
+        }
+        return clickItemAtScreenPoint(screenPoint, clickCount: event.clickCount)
+    }
+
+    @discardableResult
+    func clickItemAtScreenPoint(_ screenPoint: NSPoint, clickCount: Int) -> Bool {
+        guard panel.isVisible else { return false }
+        // screen -> collection view
+        guard let win = collection.window else { return false }
+        let winPoint = win.convertFromScreen(NSRect(origin: screenPoint, size: .zero)).origin
+        let local = collection.convert(winPoint, from: nil)
+        guard let path = collection.indexPathForItem(at: local) else { return false }
+        selectItem(path.item)
+        if clickCount >= 2 {
+            commit(paste: true)
+        }
+        return true
+    }
+
+    func selectItem(_ idx: Int) {
+        let rows = filtered()
+        let n = rows.count
+        guard n > 0 else { return }
+        let next = min(max(idx, 0), n - 1)
+        let prev = selected
+        selected = next
+        // Prefer in-place border update; fall back to reload if cells not materialized.
+        let oldCell = (prev >= 0 && prev < n) ? collection.item(at: IndexPath(item: prev, section: 0)) as? ClipCell : nil
+        let newCell = collection.item(at: IndexPath(item: next, section: 0)) as? ClipCell
+        if oldCell != nil || newCell != nil {
+            if prev != next, let oldCell, prev < n {
+                let when = rel.localizedString(for: rows[prev].created, relativeTo: Date())
+                oldCell.apply(rows[prev], selected: false, when: when, index: prev + 1)
+            }
+            if let newCell {
+                let when = rel.localizedString(for: rows[next].created, relativeTo: Date())
+                newCell.apply(rows[next], selected: true, when: when, index: next + 1)
+            }
+        } else {
+            collection.reloadData()
+        }
+        collection.selectionIndexPaths = [IndexPath(item: next, section: 0)]
+        collection.scrollToItems(at: [IndexPath(item: next, section: 0)], scrollPosition: [])
+    }
+
     func collectionView(_ collectionView: NSCollectionView, didSelectItemsAt indexPaths: Set<IndexPath>) {
         guard let item = indexPaths.first?.item else { return }
-        selected = item
-        collectionView.reloadData()
+        selectItem(item)
     }
 
     @objc func pasteSelected() { commit(paste: true) }
@@ -592,11 +689,28 @@ if let screen = NSScreen.main ?? NSScreen.screens.first {
     func commit(paste: Bool) {
         guard let clip = selectedClip() else { return }
         guard store.put(clip, on: .general) else { return }
+        store.touch(clip.id)
         suppressChange = NSPasteboard.general.changeCount
         lastChange = suppressChange
         panel.orderOut(nil)
-        guard paste, AXIsProcessTrusted() else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.06) { postCommandV() }
+        guard paste else { return }
+        guard AXIsProcessTrusted() else {
+            // Clipboard already updated — user can ⌘V manually.
+            return
+        }
+        let target = previousApp
+        // Restore key focus to the app that owned the caret, then synthesize ⌘V.
+        DispatchQueue.main.async {
+            NSApp.hide(nil)
+            if let target, !target.isTerminated,
+               target.bundleIdentifier != Bundle.main.bundleIdentifier {
+                target.activate()
+            }
+            // Wait for the other app to become active before posting key events.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.22) {
+                postCommandV()
+            }
+        }
     }
 
     @objc func togglePin() {
@@ -654,9 +768,9 @@ if let screen = NSScreen.main ?? NSScreen.screens.first {
     func move(_ delta: Int) {
         let n = filtered().count
         guard n > 0 else { return }
-        selected = min(max(selected + delta, 0), n - 1)
-        collection.reloadData()
-        collection.selectItems(at: [IndexPath(item: selected, section: 0)], scrollPosition: .centeredHorizontally)
+        let next = min(max(selected + delta, 0), n - 1)
+        selectItem(next)
+        collection.scrollToItems(at: [IndexPath(item: selected, section: 0)], scrollPosition: .centeredHorizontally)
     }
 
     func localKey(_ event: NSEvent) -> NSEvent? {
@@ -675,13 +789,15 @@ if let screen = NSScreen.main ?? NSScreen.screens.first {
 }
 
 func postCommandV() {
-    let source = CGEventSource(stateID: .hidSystemState)
-    let down = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: true)
-    let up = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: false)
-    down?.flags = .maskCommand
-    up?.flags = .maskCommand
-    down?.post(tap: .cghidEventTap)
-    up?.post(tap: .cghidEventTap)
+    // kVK_ANSI_V = 0x09
+    let source = CGEventSource(stateID: .combinedSessionState)
+    source?.localEventsSuppressionInterval = 0
+    guard let down = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: true),
+          let up = CGEvent(keyboardEventSource: source, virtualKey: 0x09, keyDown: false) else { return }
+    down.flags = .maskCommand
+    up.flags = .maskCommand
+    down.post(tap: .cgSessionEventTap)
+    up.post(tap: .cgSessionEventTap)
 }
 
 @main
